@@ -5,6 +5,12 @@ import sys
 import socket
 import threading
 
+# Import Windows-specific module for ESC key detection
+try:
+    import msvcrt
+    WINDOWS_ENV = True
+except ImportError:
+    WINDOWS_ENV = False
 
 # Import settings from the external config.py file
 from config import (
@@ -14,11 +20,8 @@ from config import (
 
 def calculate_frequency(midi_note, pitch_value=0):
     """Calculates frequency including pitch bend."""
-    # Convert pitch value (-8192 to 8191) to semitones
     bend_semitones = (pitch_value / 8192.0) * PITCH_BEND_RANGE
     actual_note = midi_note + bend_semitones
-    
-    # Calculate final frequency
     freq = round(440.0 * (2.0 ** ((actual_note - 69) / 12.0)), 2)
     return freq
 
@@ -71,70 +74,80 @@ def main():
         time.sleep(0.5)
 
         print(f"Listening to MIDI port: {actual_port_name}")
+        print("Press Ctrl+C or ESC to exit.")
         
-        # Note stack for monophonic "last note priority" behavior
         active_notes = []
         current_pitch_val = 0
         last_sent_freq = 0.0
-        last_bend_time = 0.0  # Time tracker for throttling
+        last_bend_time = 0.0
 
         with mido.open_input(actual_port_name) as inport:
-            for msg in inport:
-                
-                # --- NOTE ON ---
-                if msg.type == 'note_on' and msg.velocity > 0:
-                    if msg.note in active_notes:
-                        active_notes.remove(msg.note)
-                    active_notes.append(msg.note) # Add to top of stack
+            while True:
+                # --- Keyboard Interrupt Handling (ESC Key) ---
+                if WINDOWS_ENV and msvcrt.kbhit():
+                    # b'\x1b' is the bytecode for ESC
+                    if msvcrt.getch() == b'\x1b':
+                        print("\nESC pressed. Exiting...")
+                        break
+
+                # --- Non-blocking MIDI Processing ---
+                for msg in inport.iter_pending():
                     
-                    active_note = active_notes[-1]
-                    freq = calculate_frequency(active_note, current_pitch_val)
-                    
-                    cmd = f":beep frequency={freq} length={LONG_BEEP}\r"
-                    shell.send(cmd)
-                    last_sent_freq = freq
-                    print(f"ON   | Note: {active_note} | Freq: {freq}Hz")
-                
-                # --- NOTE OFF ---    
-                elif msg.type == 'note_off' or (msg.type == 'note_on' and msg.velocity == 0):
-                    if msg.note in active_notes:
-                        active_notes.remove(msg.note)
+                    # --- NOTE ON ---
+                    if msg.type == 'note_on' and msg.velocity > 0:
+                        if msg.note in active_notes:
+                            active_notes.remove(msg.note)
+                        active_notes.append(msg.note)
                         
-                    if len(active_notes) > 0:
-                        # Re-trigger the previous note in the stack
                         active_note = active_notes[-1]
                         freq = calculate_frequency(active_note, current_pitch_val)
+                        
                         cmd = f":beep frequency={freq} length={LONG_BEEP}\r"
                         shell.send(cmd)
                         last_sent_freq = freq
-                        print(f"BACK | Note: {active_note} | Freq: {freq}Hz")
-                    else:
-                        # Stack is empty, kill sound
-                        cmd = f":beep frequency=20 length={STOP_BEEP}\r"
-                        shell.send(cmd)
-                        print(f"OFF  | Note: {msg.note}")
-                
-                # --- PITCH BEND ---
-                elif msg.type == 'pitchwheel':
-                    current_pitch_val = msg.pitch
-                    current_time = time.time()
+                        print(f"ON   | Note: {active_note} | Freq: {freq}Hz")
                     
-                    # Throttle updates based on time, but ALWAYS allow returning to center (pitch 0)
-                    if (current_time - last_bend_time >= PITCH_THROTTLE) or msg.pitch == 0:
+                    # --- NOTE OFF ---    
+                    elif msg.type == 'note_off' or (msg.type == 'note_on' and msg.velocity == 0):
+                        if msg.note in active_notes:
+                            active_notes.remove(msg.note)
+                            
                         if len(active_notes) > 0:
                             active_note = active_notes[-1]
                             freq = calculate_frequency(active_note, current_pitch_val)
-                            
-                            # Also throttle based on frequency change, unless returning to center
-                            if abs(freq - last_sent_freq) >= MIN_FREQ_CHANGE or msg.pitch == 0:
-                                cmd = f":beep frequency={freq} length={LONG_BEEP}\r"
-                                shell.send(cmd)
-                                last_sent_freq = freq
-                                last_bend_time = current_time
-                                print(f"BEND | Note: {active_note} | Freq: {freq}Hz | Pitch: {msg.pitch}")
+                            cmd = f":beep frequency={freq} length={LONG_BEEP}\r"
+                            shell.send(cmd)
+                            last_sent_freq = freq
+                            print(f"BACK | Note: {active_note} | Freq: {freq}Hz")
+                        else:
+                            cmd = f":beep frequency=20 length={STOP_BEEP}\r"
+                            shell.send(cmd)
+                            print(f"OFF  | Note: {msg.note}")
+                    
+                    # --- PITCH BEND ---
+                    elif msg.type == 'pitchwheel':
+                        current_pitch_val = msg.pitch
+                        current_time = time.time()
+                        
+                        if (current_time - last_bend_time >= PITCH_THROTTLE) or msg.pitch == 0:
+                            if len(active_notes) > 0:
+                                active_note = active_notes[-1]
+                                freq = calculate_frequency(active_note, current_pitch_val)
+                                
+                                if abs(freq - last_sent_freq) >= MIN_FREQ_CHANGE or msg.pitch == 0:
+                                    cmd = f":beep frequency={freq} length={LONG_BEEP}\r"
+                                    shell.send(cmd)
+                                    last_sent_freq = freq
+                                    last_bend_time = current_time
+                                    print(f"BEND | Note: {active_note} | Freq: {freq}Hz | Pitch: {msg.pitch}")
 
+                # Yield execution to allow OS to process Ctrl+C
+                time.sleep(0.001)
+
+    except KeyboardInterrupt:
+        print("\nCtrl+C pressed. Exiting...")
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"\nError: {e}")
         sys.exit(1)
     finally:
         ssh_client.close()
